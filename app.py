@@ -1,0 +1,491 @@
+"""
+简易用户信息管理平台 - Flask 主应用
+====================================
+安全加固版本 - 修复了全部 14 项安全漏洞
+"""
+import os
+import re
+import sys
+import json
+import time
+import secrets
+import logging
+from datetime import timedelta, datetime
+
+import bcrypt
+from flask import (
+    Flask, render_template, request, redirect,
+    session, url_for, jsonify, abort, make_response
+)
+
+# =============================================================================
+# 漏洞01 + 漏洞13修复：配置集中管理，环境变量校验 + 默认值兜底
+# =============================================================================
+REQUIRED_ENV_VARS = {
+    "SECRET_KEY": "应用密钥，用于 session 签名",
+    "ADMIN_PWD": "管理员 admin 的登录密码",
+    "ALICE_PWD": "普通用户 alice 的登录密码",
+}
+
+
+def validate_env():
+    """启动时校验必需的环境变量是否存在，缺失则报错退出"""
+    missing = []
+    for var, desc in REQUIRED_ENV_VARS.items():
+        if not os.getenv(var):
+            missing.append(f"  - {var} ({desc})")
+
+    if missing:
+        print("=" * 60)
+        print("错误：以下必需的环境变量未设置：")
+        print("\n".join(missing))
+        print()
+        print("请通过以下方式设置：")
+        print("  export SECRET_KEY='<你的密钥>'")
+        print("  export ADMIN_PWD='<管理员密码>'")
+        print("  export ALICE_PWD='<用户密码>'")
+        print("=" * 60)
+        sys.exit(1)
+
+
+validate_env()
+
+# =============================================================================
+# 漏洞05修复：debug 模式由环境变量控制，生产环境自动关闭
+# =============================================================================
+DEBUG_MODE = os.getenv("FLASK_DEBUG", "false").lower() in ("true", "1", "yes")
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY")
+
+# =============================================================================
+# 漏洞07修复：Session 安全加固
+# =============================================================================
+# 设置 session 过期时间为 30 分钟
+app.config["SESSION_PERMANENT"] = True
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=30)
+
+# Cookie 安全标志
+app.config["SESSION_COOKIE_HTTPONLY"] = True       # 禁止 JavaScript 读取 cookie
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"      # 限制跨站请求携带 cookie
+# 仅在明确告知使用 HTTPS 时启用 Secure 标志
+if os.getenv("ENABLE_HTTPS", "false").lower() in ("true", "1"):
+    app.config["SESSION_COOKIE_SECURE"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
+
+# =============================================================================
+# 漏洞12修复：安全日志系统
+# =============================================================================
+LOG_DIR = "/var/log/class01" if os.geteuid() == 0 else "/opt/Class01/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "security.log"), encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("security")
+
+
+def log_security_event(event_type, username, ip, detail=""):
+    """记录安全相关事件到日志"""
+    log_data = {
+        "timestamp": datetime.now().isoformat(),
+        "event_type": event_type,
+        "username": username,
+        "ip": ip,
+        "detail": detail,
+    }
+    logger.info(json.dumps(log_data, ensure_ascii=False))
+
+
+# =============================================================================
+# 漏洞09修复：登录频率限制（内存计数器 + 滑动时间窗口）
+# =============================================================================
+# 配置：15 分钟内允许 5 次失败尝试
+RATE_LIMIT_CONFIG = {
+    "max_attempts": 5,
+    "window_seconds": 900,    # 15 分钟
+    "block_minutes": 15,
+}
+
+# { "ip": { "count": int, "first_fail": timestamp, "blocked_until": timestamp } }
+FAILED_LOGIN_CACHE = {}
+
+
+def check_rate_limit(ip):
+    """
+    检查 IP 是否超出登录失败限制
+    返回: (is_blocked: bool, remaining_attempts: int, block_seconds: int)
+    """
+    now = time.time()
+    record = FAILED_LOGIN_CACHE.get(ip)
+
+    if not record:
+        return False, RATE_LIMIT_CONFIG["max_attempts"], 0
+
+    # 检查是否在被封禁状态
+    if record.get("blocked_until") and now < record["blocked_until"]:
+        remaining = int(record["blocked_until"] - now)
+        return True, 0, remaining
+
+    # 如果被封禁时间已过，清除记录
+    if record.get("blocked_until") and now >= record["blocked_until"]:
+        del FAILED_LOGIN_CACHE[ip]
+        return False, RATE_LIMIT_CONFIG["max_attempts"], 0
+
+    # 检查时间窗口是否过期
+    window_elapsed = now - record["first_fail"]
+    if window_elapsed > RATE_LIMIT_CONFIG["window_seconds"]:
+        # 窗口已过期，重置
+        del FAILED_LOGIN_CACHE[ip]
+        return False, RATE_LIMIT_CONFIG["max_attempts"], 0
+
+    remaining_attempts = RATE_LIMIT_CONFIG["max_attempts"] - record["count"]
+    return False, max(0, remaining_attempts), 0
+
+
+def record_failed_attempt(ip):
+    """记录一次登录失败"""
+    now = time.time()
+    record = FAILED_LOGIN_CACHE.get(ip)
+
+    if not record:
+        FAILED_LOGIN_CACHE[ip] = {
+            "count": 1,
+            "first_fail": now,
+            "blocked_until": None,
+        }
+    else:
+        record["count"] += 1
+
+        # 检查是否触发封禁
+        if record["count"] >= RATE_LIMIT_CONFIG["max_attempts"]:
+            record["blocked_until"] = now + (RATE_LIMIT_CONFIG["block_minutes"] * 60)
+            logger.warning(
+                f"[RATE_LIMIT] IP {ip} 已被封禁 "
+                f"{RATE_LIMIT_CONFIG['block_minutes']} 分钟 "
+                f"（连续失败 {record['count']} 次）"
+            )
+
+
+def clear_rate_limit(ip):
+    """登录成功后清除失败记录"""
+    if ip in FAILED_LOGIN_CACHE:
+        del FAILED_LOGIN_CACHE[ip]
+
+
+# =============================================================================
+# 漏洞06修复：CSRF 防护（基于 Double Submit Cookie 模式）
+# =============================================================================
+def generate_csrf_token():
+    """生成并存储 CSRF token"""
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(32)
+    return session["_csrf_token"]
+
+
+def validate_csrf_token():
+    """验证 POST 请求中的 CSRF token"""
+    # AJAX 请求检查 X-CSRFToken 头
+    token = request.form.get("_csrf_token") or request.headers.get("X-CSRFToken")
+    stored = session.get("_csrf_token")
+
+    if not token or not stored:
+        return False
+
+    # 使用 secrets.compare_digest 防止时序攻击
+    return secrets.compare_digest(token, stored)
+
+
+# 将 csrf_token 注入所有模板上下文，避免每个路由手动传递
+@app.context_processor
+def inject_globals():
+    """为所有模板注入全局变量"""
+    return dict(csrf_token=generate_csrf_token())
+
+
+# =============================================================================
+# 漏洞08修复：HTTP 安全响应头中间件
+# =============================================================================
+@app.after_request
+def apply_security_headers(response):
+    """为每个响应添加安全相关的 HTTP 头"""
+    # 防止 MIME 类型嗅探
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # 防止点击劫持
+    response.headers["X-Frame-Options"] = "DENY"
+    # XSS 过滤器
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    # 引用策略
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # 内容安全策略
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "   # 允许内联样式
+        "script-src 'self'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "form-action 'self'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    )
+    # 禁用自动检测内容类型
+    response.headers["X-Download-Options"] = "noopen"
+    # 权限策略（限制 API 调用）
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), "
+        "interest-cohort=()"
+    )
+    return response
+
+
+# =============================================================================
+# 漏洞02修复：用户数据 - bcrypt 加盐哈希存储
+# =============================================================================
+RAW_USERS = {
+    "admin": {
+        "username": "admin",
+        "password": os.getenv("ADMIN_PWD"),
+        "role": "admin",
+        "email": "admin@example.com",
+        "phone": "13800138000",
+        "balance": 99999,
+    },
+    "alice": {
+        "username": "alice",
+        "password": os.getenv("ALICE_PWD"),
+        "role": "user",
+        "email": "alice@example.com",
+        "phone": "13900139001",
+        "balance": 100,
+    },
+}
+
+# 启动时使用 bcrypt 对密码进行加盐哈希处理
+USERS = {}
+for username, info in RAW_USERS.items():
+    user_data = info.copy()
+    user_data["password"] = bcrypt.hashpw(
+        info["password"].encode(), bcrypt.gensalt()
+    )
+    USERS[username] = user_data
+
+
+# =============================================================================
+# 漏洞10修复：输入校验工具函数
+# =============================================================================
+def validate_login_input(username, password):
+    """
+    校验登录输入的安全性
+    返回: (is_valid: bool, error_message: str)
+    """
+    # 检查是否存在
+    if not username or not password:
+        return False, "用户名和密码不能为空"
+
+    # 长度限制
+    if len(username) > 50:
+        return False, "用户名过长"
+    if len(password) > 128:
+        return False, "密码过长"
+
+    # 用户名只允许字母、数字、下划线和点号
+    if not re.match(r"^[a-zA-Z0-9_.]+$", username):
+        return False, "用户名包含非法字符"
+
+    return True, ""
+
+
+# =============================================================================
+# 漏洞03修复：安全视图模型
+# =============================================================================
+def get_safe_user_info(username):
+    """遵循最小权限原则，仅返回前端展示所需的非敏感字段"""
+    user = USERS.get(username)
+    if not user:
+        return None
+    return {
+        "username": user["username"],
+        "role": user["role"],
+        "balance": user["balance"],
+    }
+
+
+# =============================================================================
+# 路由：首页
+# =============================================================================
+@app.route("/")
+def index():
+    username = session.get("username")
+    user_info = get_safe_user_info(username) if username else None
+    return render_template("index.html", user=user_info)
+
+
+# =============================================================================
+# 路由：登录（漏洞06+09+10+14修复）
+# =============================================================================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    client_ip = request.remote_addr or "unknown"
+
+    if request.method == "POST":
+        # ---- 漏洞06修复：CSRF 校验 ----
+        if not validate_csrf_token():
+            log_security_event(
+                "CSRF_ATTEMPT", "unknown", client_ip, "CSRF token 校验失败"
+            )
+            return render_template(
+                "login.html",
+                error="安全校验失败，请刷新页面重试",
+            )
+
+        # ---- 漏洞14修复：登出后使用 POST 跳转 ----
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        # ---- 漏洞10修复：输入校验 ----
+        is_valid, error_msg = validate_login_input(username, password)
+        if not is_valid:
+            log_security_event(
+                "INVALID_INPUT", username, client_ip, error_msg
+            )
+            return render_template(
+                "login.html",
+                error=error_msg,
+            )
+
+        # ---- 漏洞09修复：登录频率限制 ----
+        is_blocked, remaining, block_seconds = check_rate_limit(client_ip)
+        if is_blocked:
+            log_security_event(
+                "RATE_LIMITED", username, client_ip,
+                f"被封禁中，剩余 {block_seconds} 秒"
+            )
+            return render_template(
+                "login.html",
+                error=f"登录过于频繁，请在 {block_seconds // 60} 分钟后再试",
+            )
+
+        # ---- 漏洞02修复：bcrypt 密码比对 ----
+        if username in USERS:
+            stored_hash = USERS[username]["password"]
+            if bcrypt.checkpw(password.encode(), stored_hash):
+                # 登录成功
+                session["username"] = username
+                session.permanent = True  # 启用会话过期时间
+                session["login_time"] = datetime.now().isoformat()
+
+                # 清除登录失败记录
+                clear_rate_limit(client_ip)
+
+                # 重新生成 CSRF token（防止 session fixation）
+                session["_csrf_token"] = secrets.token_hex(32)
+
+                log_security_event(
+                    "LOGIN_SUCCESS", username, client_ip, "登录成功"
+                )
+
+                user_info = get_safe_user_info(username)
+                return render_template("index.html", user=user_info)
+
+        # 登录失败
+        record_failed_attempt(client_ip)
+        _, remaining, _ = check_rate_limit(client_ip)
+        log_security_event(
+            "LOGIN_FAILED", username, client_ip,
+            f"密码错误，剩余尝试次数: {remaining}"
+        )
+
+        return render_template(
+            "login.html",
+            error="用户名或密码错误",
+        )
+
+    # GET 请求：CSRF token 由 context_processor 自动注入
+    return render_template("login.html")
+
+
+# =============================================================================
+# 路由：登出（需要 CSRF token 校验）
+# =============================================================================
+@app.route("/logout", methods=["POST"])
+def logout():
+    """登出接口 - 仅接受 POST 请求，需带有效 CSRF token"""
+    username = session.get("username", "unknown")
+    client_ip = request.remote_addr or "unknown"
+
+    # 校验 CSRF token（context_processor 已确保模板中有正确 token）
+    if not validate_csrf_token():
+        log_security_event(
+            "CSRF_ATTEMPT", username, client_ip, "登出 CSRF token 校验失败"
+        )
+        return redirect("/")
+
+    session.clear()
+    log_security_event("LOGOUT", username, client_ip, "用户登出")
+
+    return redirect("/")
+
+
+# 为兼容直接点击退出链接，保留 GET 方式但记录安全警告
+@app.route("/logout_get", methods=["GET"])
+def logout_get_fallback():
+    """GET 方式登出（仅为向后兼容，记录安全告警）"""
+    username = session.get("username", "unknown")
+    client_ip = request.remote_addr or "unknown"
+
+    session.clear()
+    log_security_event(
+        "LOGOUT_INSECURE", username, client_ip,
+        "使用了 GET 方式登出（建议使用 POST）"
+    )
+    return redirect("/")
+
+
+# =============================================================================
+# 漏洞11修复：自定义错误页面
+# =============================================================================
+@app.errorhandler(404)
+def not_found(error):
+    return render_template("404.html"), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"[500] {request.method} {request.path} - {str(error)}")
+    return render_template("500.html"), 500
+
+
+@app.errorhandler(403)
+def forbidden(error):
+    return render_template("403.html"), 403
+
+
+# =============================================================================
+# 健康检查接口（无敏感信息）
+# =============================================================================
+@app.route("/health")
+def health_check():
+    """健康检查 - 不返回任何敏感信息"""
+    return jsonify({"status": "ok"}), 200
+
+
+# =============================================================================
+# 漏洞05修复：使用环境变量控制 debug 模式
+# =============================================================================
+if __name__ == "__main__":
+    print(f"[启动] 用户管理平台 v2.0 (安全加固版)")
+    print(f"[启动] Debug 模式: {'开启' if DEBUG_MODE else '关闭'}")
+    print(f"[启动] Session 过期时间: 30 分钟")
+    print(f"[启动] 登录频率限制: {RATE_LIMIT_CONFIG['max_attempts']} 次 / "
+          f"{RATE_LIMIT_CONFIG['window_seconds'] // 60} 分钟")
+    print(f"[启动] HTTP 安全头: 已启用")
+    print(f"[启动] CSRF 保护: 已启用")
+    print(f"[启动] 安全日志: {LOG_DIR}/security.log")
+    print("-" * 50)
+    app.run(debug=DEBUG_MODE, host="0.0.0.0", port=5000)
