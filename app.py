@@ -8,6 +8,7 @@ import re
 import sys
 import json
 import time
+import sqlite3
 import secrets
 import logging
 from datetime import timedelta, datetime
@@ -49,6 +50,43 @@ def validate_env():
 
 
 validate_env()
+
+# =============================================================================
+# 数据库初始化
+# =============================================================================
+DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DB_PATH = os.path.join(DB_DIR, "users.db")
+
+
+def init_db():
+    """初始化 SQLite 数据库，创建 users 表并插入默认用户"""
+    os.makedirs(DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # 创建 users 表
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email TEXT,
+            phone TEXT
+        )
+    """)
+
+    # 插入默认用户（INSERT OR IGNORE 防止重复）
+    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
+              ("admin", "admin123", "admin@example.com", "13800138000"))
+    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
+              ("alice", "alice2025", "alice@example.com", "13900139001"))
+
+    conn.commit()
+    conn.close()
+    print(f"[数据库] 初始化完成: {DB_PATH}")
+
+
+init_db()
 
 # =============================================================================
 # 漏洞05修复：debug 模式由环境变量控制，生产环境自动关闭
@@ -323,7 +361,27 @@ def get_safe_user_info(username):
 def index():
     username = session.get("username")
     user_info = get_safe_user_info(username) if username else None
-    return render_template("index.html", user=user_info)
+
+    # 处理搜索功能
+    keyword = request.args.get("keyword", "")
+    search_results = None
+    if keyword:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # 漏洞修复：使用参数化查询 ? 占位符替代 f-string 拼接
+        like_pattern = f"%{keyword}%"
+        sql = "SELECT id, username, email, phone FROM users WHERE username LIKE ? OR email LIKE ?"
+        print(f"[搜索] 执行 SQL: {sql} | 参数: keyword={keyword}")
+        try:
+            c.execute(sql, (like_pattern, like_pattern))
+            search_results = c.fetchall()
+            print(f"[搜索] 返回 {len(search_results)} 条结果")
+        except Exception as e:
+            print(f"[搜索] SQL 执行出错: {e}")
+            search_results = []
+        conn.close()
+
+    return render_template("index.html", user=user_info, search_results=search_results, keyword=keyword)
 
 
 # =============================================================================
@@ -407,7 +465,8 @@ def login():
         )
 
     # GET 请求：CSRF token 由 context_processor 自动注入
-    return render_template("login.html")
+    success = request.args.get("success", "")
+    return render_template("login.html", success=success)
 
 
 # =============================================================================
@@ -445,6 +504,66 @@ def logout_get_fallback():
         "使用了 GET 方式登出（建议使用 POST）"
     )
     return redirect("/")
+
+
+# =============================================================================
+# 路由：注册
+# =============================================================================
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        email = request.form.get("email", "").strip()
+        phone = request.form.get("phone", "").strip()
+
+        # 漏洞修复：使用参数化查询 ? 占位符替代 f-string 拼接
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        sql = "INSERT INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)"
+        print(f"[注册] 执行 SQL: {sql} | 参数: username={username}, email={email}, phone={phone}")
+        try:
+            c.execute(sql, (username, password, email, phone))
+            conn.commit()
+            print(f"[注册] 用户 {username} 注册成功")
+            conn.close()
+            return redirect("/login?success=1")
+        except Exception as e:
+            print(f"[注册] SQL 执行出错: {e}")
+            conn.close()
+            return render_template("register.html", error=f"注册失败: {str(e)}")
+
+    return render_template("register.html")
+
+
+# =============================================================================
+# 路由：搜索
+# =============================================================================
+@app.route("/search", methods=["GET"])
+def search():
+    keyword = request.args.get("keyword", "")
+
+    if not keyword:
+        return redirect("/")
+
+    # 漏洞修复：使用参数化查询 ? 占位符替代 f-string 拼接
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    like_pattern = f"%{keyword}%"
+    sql = "SELECT id, username, email, phone FROM users WHERE username LIKE ? OR email LIKE ?"
+    print(f"[搜索] 执行 SQL: {sql} | 参数: keyword={keyword}")
+    try:
+        c.execute(sql, (like_pattern, like_pattern))
+        search_results = c.fetchall()
+        print(f"[搜索] 返回 {len(search_results)} 条结果")
+    except Exception as e:
+        print(f"[搜索] SQL 执行出错: {e}")
+        search_results = []
+    conn.close()
+
+    username = session.get("username")
+    user_info = get_safe_user_info(username) if username else None
+    return render_template("index.html", user=user_info, search_results=search_results, keyword=keyword)
 
 
 # =============================================================================

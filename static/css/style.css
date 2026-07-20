@@ -237,6 +237,99 @@ body {
     margin-bottom: 16px;
 }
 
+/* 成功提示 */
+.success-msg {
+    background-color: #e8fde8;
+    color: #27ae60;
+    border: 1px solid #d5f5d5;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 14px;
+    margin-bottom: 16px;
+}
+
+/* 搜索表单 */
+.search-form {
+    margin-bottom: 20px;
+}
+
+.search-group {
+    display: flex;
+    gap: 8px;
+}
+
+.search-input {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.search-input:focus {
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.15);
+}
+
+/* 搜索结果 */
+.search-results {
+    margin-top: 12px;
+}
+
+.search-results h3 {
+    font-size: 16px;
+    color: #555;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #eee;
+}
+
+.result-count {
+    font-size: 12px;
+    color: #999;
+    font-weight: 400;
+    margin-left: 8px;
+}
+
+.no-result {
+    text-align: center;
+    color: #999;
+    font-size: 14px;
+    padding: 20px 0;
+}
+
+/* 结果表格 */
+.result-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.result-table thead th {
+    background-color: #f8f9fa;
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: #555;
+    border-bottom: 2px solid #e9ecef;
+}
+
+.result-table tbody td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #f0f0f0;
+    color: #444;
+}
+
+.result-table tbody tr:hover {
+    background-color: #f8f9ff;
+}
+
+.result-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
 /* 错误页面专用样式 */
 .error-card {
     text-align: center;
