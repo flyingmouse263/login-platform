@@ -8,6 +8,7 @@ import re
 import sys
 import json
 import time
+import uuid
 import sqlite3
 import secrets
 import logging
@@ -81,6 +82,18 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
               ("alice", "alice2025", "alice@example.com", "13900139001"))
 
+    # 照片上传记录表（漏洞06修复：文件与用户关联）
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            upload_time TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
     print(f"[数据库] 初始化完成: {DB_PATH}")
@@ -95,6 +108,36 @@ DEBUG_MODE = os.getenv("FLASK_DEBUG", "false").lower() in ("true", "1", "yes")
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+
+# 上传配置：最大 16MB
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+# 漏洞07修复：限制请求体读取大小，防止流式绕过
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+UPLOAD_DIR = os.path.join(app.root_path, "static", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# 漏洞01+02修复：只允许图片类型
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
+
+
+def is_allowed_file(filename):
+    """检查文件扩展名是否在允许列表中"""
+    if "." not in filename:
+        return False
+    ext = filename.rsplit(".", 1)[1].lower()
+    return ext in ALLOWED_EXTENSIONS
+
+
+def safe_filename(filename):
+    """漏洞03+05修复：去除路径穿越字符和危险字符，保留可读文件名"""
+    # 只取文件名部分，去除路径
+    safe = os.path.basename(filename)
+    # 只保留字母、数字、点、下划线、短横线
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", safe)
+    # 防止空文件名和以点开头
+    if not safe or safe.startswith("."):
+        safe = f"upload_{uuid.uuid4().hex[:8]}"
+    return safe
 
 # =============================================================================
 # 漏洞07修复：Session 安全加固
@@ -564,6 +607,71 @@ def search():
     username = session.get("username")
     user_info = get_safe_user_info(username) if username else None
     return render_template("index.html", user=user_info, search_results=search_results, keyword=keyword)
+
+
+# =============================================================================
+# 路由：头像上传（文件上传漏洞修补：全部7项漏洞修复）
+# =============================================================================
+@app.route("/upload", methods=["GET", "POST"])
+def upload():
+    """用户头像上传 - 需要登录"""
+    username = session.get("username")
+    if not username:
+        return redirect("/login")
+
+    if request.method == "POST":
+        file = request.files.get("file")
+        if not file or file.filename == "":
+            return render_template("upload.html", error="请选择要上传的文件")
+
+        original_name = file.filename
+
+        # 漏洞07修复：手动检查 Content-Length 防止流式绕过
+        content_length = request.content_length or 0
+        if content_length > 16 * 1024 * 1024:
+            print(f"[上传] 用户 {username} 上传文件超过大小限制: {content_length} bytes")
+            return render_template("upload.html", error="文件大小超过16MB限制")
+
+        # 漏洞01+02修复：校验文件扩展名，仅允许图片类型
+        if not is_allowed_file(original_name):
+            print(f"[上传] 用户 {username} 上传非法文件类型: {original_name}")
+            log_security_event("UPLOAD_REJECTED", username, request.remote_addr,
+                               f"非法文件类型: {original_name}")
+            return render_template("upload.html", error="仅允许上传 PNG、JPG、GIF、WebP 格式的图片")
+
+        # 漏洞03+05修复：清理文件名（去除路径穿越和危险字符）
+        safe_name = safe_filename(original_name)
+
+        # 漏洞04修复：检查文件名冲突，冲突时追加随机后缀
+        dest_path = os.path.join(UPLOAD_DIR, safe_name)
+        if os.path.exists(dest_path):
+            name_part, ext_part = safe_name.rsplit(".", 1) if "." in safe_name else (safe_name, "")
+            safe_name = f"{name_part}_{uuid.uuid4().hex[:8]}.{ext_part}" if ext_part else f"{name_part}_{uuid.uuid4().hex[:8]}"
+            dest_path = os.path.join(UPLOAD_DIR, safe_name)
+
+        # 保存文件
+        file.save(dest_path)
+        file_size = os.path.getsize(dest_path)
+
+        # 漏洞06修复：将上传记录存入数据库，与用户关联
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO uploads (username, filename, original_name, file_size, upload_time) VALUES (?, ?, ?, ?, ?)",
+            (username, safe_name, original_name, file_size, datetime.now().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+        # 构造访问 URL
+        file_url = url_for("static", filename=f"uploads/{safe_name}")
+        print(f"[上传] 用户 {username} 上传文件: {safe_name} ({file_size} bytes)")
+        log_security_event("UPLOAD_SUCCESS", username, request.remote_addr,
+                           f"文件: {safe_name}, 大小: {file_size} bytes")
+
+        return render_template("upload.html", success=file_url, filename=safe_name)
+
+    return render_template("upload.html")
 
 
 # =============================================================================

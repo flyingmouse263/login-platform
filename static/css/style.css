@@ -344,3 +344,44 @@ body {
     margin-bottom: 8px;
     opacity: 0.6;
 }
+
+/* 上传页面 */
+.upload-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.file-input {
+    padding: 8px 0;
+    font-size: 14px;
+}
+
+.upload-preview {
+    text-align: center;
+    margin: 16px 0;
+}
+
+.preview-img {
+    max-width: 200px;
+    max-height: 200px;
+    border-radius: 8px;
+    border: 2px solid #eee;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.upload-link {
+    font-size: 13px;
+    color: #666;
+    text-align: center;
+    word-break: break-all;
+}
+
+.upload-link a {
+    color: #667eea;
+    text-decoration: none;
+}
+
+.upload-link a:hover {
+    text-decoration: underline;
+}
