@@ -72,15 +72,26 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             email TEXT,
-            phone TEXT
+            phone TEXT,
+            balance INTEGER DEFAULT 0
         )
     """)
 
     # 插入默认用户（INSERT OR IGNORE 防止重复）
-    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
-              ("admin", "admin123", "admin@example.com", "13800138000"))
-    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
-              ("alice", "alice2025", "alice@example.com", "13900139001"))
+    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone, balance) VALUES (?, ?, ?, ?, ?)",
+              ("admin", "admin123", "admin@example.com", "13800138000", 99999))
+    c.execute("INSERT OR IGNORE INTO users (username, password, email, phone, balance) VALUES (?, ?, ?, ?, ?)",
+              ("alice", "alice2025", "alice@example.com", "13900139001", 100))
+
+    # 兼容旧数据库：为已有表补充 balance 列（如果不存在）
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # 列已存在，忽略
+
+    # 更新默认用户的余额
+    c.execute("UPDATE users SET balance = 99999 WHERE username = 'admin' AND balance IS NULL")
+    c.execute("UPDATE users SET balance = 100 WHERE username = 'alice' AND balance IS NULL")
 
     # 照片上传记录表（漏洞06修复：文件与用户关联）
     c.execute("""
@@ -286,7 +297,20 @@ def validate_csrf_token():
 @app.context_processor
 def inject_globals():
     """为所有模板注入全局变量"""
-    return dict(csrf_token=generate_csrf_token())
+    ctx = dict(csrf_token=generate_csrf_token())
+
+    # 注入当前登录用户的 user_id（用于导航栏个人中心链接）
+    username = session.get("username")
+    if username:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            ctx["current_user_id"] = row[0]
+
+    return ctx
 
 
 # =============================================================================
@@ -672,6 +696,118 @@ def upload():
         return render_template("upload.html", success=file_url, filename=safe_name)
 
     return render_template("upload.html")
+
+
+# =============================================================================
+# 路由：个人中心（R-06+R-07修复：需登录 + 敏感信息脱敏）
+# =============================================================================
+@app.route("/profile", methods=["GET"])
+def profile():
+    """个人中心 - 需登录后通过 URL 参数 user_id 查询用户资料"""
+    # R-06修复：要求登录
+    username = session.get("username")
+    if not username:
+        return redirect("/login")
+
+    user_id = request.args.get("user_id", "")
+
+    if not user_id or not user_id.isdigit():
+        return render_template("profile.html", error="无效的用户ID")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, username, email, phone, balance FROM users WHERE id = ?", (int(user_id),))
+    user = c.fetchone()
+    conn.close()
+
+    if not user:
+        return render_template("profile.html", error="用户不存在")
+
+    # R-07+R-08修复：安全视图模型，email 和 phone 仅当前用户本人可查看
+    current_username = session.get("username", "")
+    is_owner = (user[1] == current_username)
+
+    return render_template("profile.html", user={
+        "id": user[0],
+        "username": user[1],
+        "email": user[2] or "",
+        "phone": user[3] or "",
+        "balance": user[4] or 0,
+        "is_owner": is_owner,
+    })
+
+
+# =============================================================================
+# 路由：充值（R-01~R-05修复：身份校验 + 金额校验 + CSRF）
+# =============================================================================
+@app.route("/recharge", methods=["POST"])
+def recharge():
+    """充值 - 需登录 + CSRF 校验 + 金额正负/上限校验 + 身份校验"""
+    # R-06修复：要求登录
+    current_username = session.get("username")
+    if not current_username:
+        return redirect("/login")
+
+    # R-04修复：CSRF token 校验
+    if not validate_csrf_token():
+        log_security_event("CSRF_ATTEMPT", current_username, request.remote_addr,
+                           "充值 CSRF token 校验失败")
+        return redirect("/")
+
+    user_id = request.form.get("user_id", "")
+    amount_str = request.form.get("amount", "0")
+
+    if not user_id or not user_id.isdigit():
+        return redirect("/")
+
+    # R-05修复：金额必须为合法整数
+    try:
+        amount = int(amount_str)
+    except (ValueError, TypeError):
+        log_security_event("RECHARGE_INVALID_AMOUNT", current_username, request.remote_addr,
+                           f"非法金额格式: {amount_str}")
+        return redirect(f"/profile?user_id={user_id}")
+
+    # R-01修复：校验当前用户与目标 user_id 是否匹配
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username FROM users WHERE id = ?", (int(user_id),))
+    target_user = c.fetchone()
+
+    if not target_user:
+        conn.close()
+        return redirect("/")
+
+    if target_user[0] != current_username:
+        # 记录了未经授权的充值尝试
+        log_security_event("RECHARGE_UNAUTHORIZED", current_username, request.remote_addr,
+                           f"试图充值用户ID={user_id} ({target_user[0]})")
+        conn.close()
+        return redirect("/")
+
+    # R-02修复：金额必须为正数
+    if amount <= 0:
+        log_security_event("RECHARGE_NEGATIVE", current_username, request.remote_addr,
+                           f"负数/零金额: {amount}")
+        return redirect(f"/profile?user_id={user_id}")
+
+    # R-03修复：单次充值上限
+    MAX_RECHARGE = 100000
+    if amount > MAX_RECHARGE:
+        return redirect(f"/profile?user_id={user_id}")
+
+    c.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, int(user_id)))
+    conn.commit()
+
+    # 记录充值日志
+    c.execute("SELECT balance FROM users WHERE id = ?", (int(user_id),))
+    new_balance = c.fetchone()[0]
+    conn.close()
+
+    log_security_event("RECHARGE_SUCCESS", current_username, request.remote_addr,
+                       f"充值金额: {amount}, 新余额: {new_balance}")
+
+    return redirect(f"/profile?user_id={user_id}")
 
 
 # =============================================================================

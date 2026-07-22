@@ -385,3 +385,40 @@ body {
 .upload-link a:hover {
     text-decoration: underline;
 }
+
+/* 个人中心 */
+.profile-info {
+    margin-bottom: 24px;
+}
+
+.profile-info h3,
+.recharge-section h3 {
+    font-size: 16px;
+    color: #555;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #eee;
+}
+
+.balance-amount {
+    font-size: 18px;
+    font-weight: 700;
+    color: #e67e22;
+}
+
+.recharge-section {
+    margin-bottom: 16px;
+}
+
+.recharge-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* 个人中心 - 信息脱敏 */
+.info-masked {
+    color: #aaa;
+    font-size: 13px;
+    font-style: italic;
+}

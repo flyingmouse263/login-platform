@@ -13,6 +13,7 @@
         </ul>
     </div>
     <div class="action-bar">
+        <a href="/profile?user_id={{ current_user_id or '1' }}" class="btn btn-primary">个人中心</a>
         <a href="/upload" class="btn btn-primary">上传头像</a>
         <form method="POST" action="/logout" style="display:inline;">
             <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
