@@ -811,6 +811,48 @@ def recharge():
 
 
 # =============================================================================
+# 路由：动态页面加载（P-01~P-04修复）
+# =============================================================================
+@app.route("/page", methods=["GET"])
+def page():
+    """动态页面加载 - 需登录，白名单校验文件路径"""
+    # P-02修复：要求登录
+    username = session.get("username")
+    if not username:
+        return redirect("/login")
+
+    name = request.args.get("name", "")
+    page_content = None
+    page_error = None
+
+    if name:
+        # P-01+P-04修复：使用 realpath 校验文件是否在 pages/ 目录内
+        safe_base = os.path.realpath(os.path.join(app.root_path, "pages"))
+        requested_path = os.path.realpath(os.path.join(safe_base, name))
+
+        if not requested_path.startswith(safe_base + os.sep):
+            log_security_event("PAGE_TRAVERSAL", username, request.remote_addr,
+                               f"路径穿越尝试: {name}")
+            page_error = "页面不存在"
+        else:
+            # 尝试直接读取
+            if os.path.exists(requested_path):
+                with open(requested_path, "r", encoding="utf-8") as f:
+                    page_content = f.read()
+            else:
+                # 尝试加上 .html 后缀
+                requested_path_html = requested_path + ".html"
+                if os.path.exists(requested_path_html):
+                    with open(requested_path_html, "r", encoding="utf-8") as f:
+                        page_content = f.read()
+                else:
+                    page_error = "页面不存在"
+
+    user_info = get_safe_user_info(username)
+    return render_template("index.html", user=user_info, page_content=page_content, page_error=page_error)
+
+
+# =============================================================================
 # 漏洞11修复：自定义错误页面
 # =============================================================================
 @app.errorhandler(404)

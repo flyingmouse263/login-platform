@@ -1,7 +1,27 @@
 {% extends "base.html" %}
 
 {% block content %}
-{% if user %}
+{% if page_content %}
+<div class="card page-content-card">
+    <div class="page-content">
+        {{ page_content | safe }}
+        <!-- P-03: | safe 仅在 pages/ 目录内文件可用（路径穿越已拦截） -->
+    </div>
+    <div class="action-bar" style="justify-content: center; margin-top: 20px;">
+        <a href="/" class="btn btn-primary">返回首页</a>
+    </div>
+</div>
+
+{% elif page_error %}
+<div class="card" style="text-align:center; padding:48px;">
+    <h2 class="card-title">{{ page_error }}</h2>
+    <p class="card-desc">您访问的页面不存在。</p>
+    <div class="action-bar" style="justify-content:center;">
+        <a href="/" class="btn btn-primary">返回首页</a>
+    </div>
+</div>
+
+{% elif user %}
 <div class="card">
     <h2 class="card-title">欢迎回来，{{ user.username }}！</h2>
     <div class="user-info">
@@ -15,6 +35,7 @@
     <div class="action-bar">
         <a href="/profile?user_id={{ current_user_id or '1' }}" class="btn btn-primary">个人中心</a>
         <a href="/upload" class="btn btn-primary">上传头像</a>
+        <a href="/page?name=help" class="btn btn-primary">帮助中心</a>
         <form method="POST" action="/logout" style="display:inline;">
             <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
             <button type="submit" class="btn btn-danger">退出登录</button>
